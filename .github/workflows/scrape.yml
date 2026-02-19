@@ -1,0 +1,36 @@
+name: NVAR Market Stats Scraper
+
+on:
+  schedule:
+    - cron: '0 14 * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape-and-send:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run NVAR scraper
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GHL_WEBHOOK_URL: ${{ secrets.GHL_WEBHOOK_URL }}
+        run: python scrape_nvar.py
+
+      - name: Commit last_sent.txt (track sent posts)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_sent.txt
+          git diff --staged --quiet || git commit -m "Update last_sent.txt [skip ci]"
+          git push
