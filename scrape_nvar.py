@@ -324,6 +324,37 @@ def should_send_this_month(tags):
     return True
 
 
+# -- Claude API Helper ---------------------------------------------
+
+def call_claude(prompt):
+    """Generic Claude API call. Returns response text or None on failure."""
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 500,
+                "temperature": 0.7,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["content"][0]["text"].strip().strip('"')
+    except Exception as e:
+        print(f"    Claude API error: {e}")
+        return None
+
+
 # -- SMS Generation (AI) ------------------------------------------
 
 def generate_message_for_tag(tag, stats, first_name="", contact_index=0):
@@ -382,33 +413,10 @@ RULES:
 
 WRITE ONLY THE TEXT MESSAGE. Nothing else."""
 
-    if not ANTHROPIC_API_KEY:
-        return generate_template_message(tag, stats, first_name)
-
-    try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 300,
-                "temperature": 0.9,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        message = data["content"][0]["text"].strip().strip('"')
+    message = call_claude(prompt)
+    if message:
         return message
-
-    except Exception as e:
-        print(f"    Claude API error: {e}")
-        return generate_template_message(tag, stats, first_name)
+    return generate_template_message(tag, stats, first_name)
 
 
 def generate_template_message(tag, stats, first_name=""):
@@ -433,6 +441,110 @@ def generate_template_message(tag, stats, first_name=""):
 
 
 # -- Email Generation (sent to Alex for review) --------------------
+
+def generate_email_insight(tag, stats):
+    """Use Claude to generate the 'What this means' and 'My advice' sections."""
+    month = stats.get("report_month", "")
+    year = stats.get("report_year", "")
+    median = stats.get("median_price", "")
+    median_chg = stats.get("median_price_change", "")
+    inv = stats.get("active_listings", "")
+    inv_chg = stats.get("active_listings_change", "")
+    dom = stats.get("days_on_market", "")
+    dom_chg = stats.get("dom_change", "")
+    pending = stats.get("pending_sales", "")
+    pending_chg = stats.get("pending_sales_change", "")
+    closed = stats.get("closed_sales", "")
+    closed_chg = stats.get("closed_sales_change", "")
+    supply = stats.get("months_supply", "")
+
+    try:
+        median_fmt = f"${int(median):,}"
+    except (ValueError, TypeError):
+        median_fmt = f"${median}"
+
+    if tag == "seller":
+        audience_context = (
+            "This email is going to SELLERS — homeowners who may be thinking about selling. "
+            "Frame the insight around what these numbers mean for their home's value and market position. "
+            "The advice should be actionable and specific to sellers."
+        )
+    elif tag == "buyer":
+        audience_context = (
+            "This email is going to BUYERS — people actively looking to buy a home. "
+            "Frame the insight around what these numbers mean for their search, negotiating power, and opportunity. "
+            "The advice should be actionable and specific to buyers."
+        )
+    else:
+        audience_context = (
+            "This email is going to GENERAL contacts who could be buyers OR sellers. "
+            "Write TWO sections: one paragraph for people thinking about selling and one for people thinking about buying. "
+            "Use headers 'If you're thinking about selling:' and 'If you're thinking about buying:' for each. "
+            "Each section should have its own insight and advice based on the data."
+        )
+
+    prompt = f"""You are Alex Marcia, a realtor in Northern Virginia. Write the insight and advice 
+sections for a monthly market update email.
+
+{audience_context}
+
+{month} {year} DATA:
+- Median sold price: {median_fmt} ({median_chg} vs last year)
+- Active listings: {inv} ({inv_chg} vs last year)
+- Days on market: {dom} ({dom_chg} vs last year)
+- Pending sales: {pending} ({pending_chg} vs last year)
+- Closed sales: {closed} ({closed_chg} vs last year)
+- Months of supply: {supply}
+
+WRITE TWO SECTIONS:
+
+1. "What this means:" — 2-3 sentences of honest, data-backed analysis. Reference specific numbers. 
+   Explain what the data actually tells us, not generic filler. Every statement should connect to a number above.
+
+2. "My advice:" — 2-3 sentences of practical, specific guidance based on what the numbers show.
+   Not generic "be prepared" fluff. Actual strategy tied to the current data.
+
+RULES:
+- ONLY make statements backed by the numbers above. Never speculate or assume.
+- NEVER say "great time to buy/sell" or make value judgments.
+- Be honest about both sides — opportunity AND risk.
+- Warm, professional tone. Not salesy.
+- No hyphens or dashes. Use commas and periods.
+
+WRITE ONLY the two sections. Start with "What this means:" and then "My advice:". Nothing else."""
+
+    result = call_claude(prompt)
+    if result:
+        return result
+
+    # Fallback if Claude fails
+    if tag == "seller":
+        return (
+            f"What this means: Supply is at {supply} months. Buyers have more to choose "
+            f"from now which means they're being more selective. The homes that are "
+            f"moving are the ones priced right and prepped well.\n\n"
+            f"My advice: Preparation matters more than ever right now. A solid pre-listing "
+            f"strategy around pricing, staging, and timing can make a real difference."
+        )
+    elif tag == "buyer":
+        return (
+            f"What this means: There's {inv_chg} more inventory than last year and "
+            f"homes are sitting longer, which gives you more time to be thoughtful. "
+            f"That said, supply is still only {supply} months so it's still competitive.\n\n"
+            f"My advice: With more options available, being pre-approved and ready to "
+            f"move quickly on the right home is your biggest advantage."
+        )
+    else:
+        return (
+            f"If you're thinking about selling: Supply is at {supply} months. Buyers have "
+            f"more to choose from now which means they're being more selective. The homes "
+            f"moving are the ones priced right and prepped well. A solid pre-listing strategy "
+            f"around pricing, staging, and timing can make a real difference.\n\n"
+            f"If you're thinking about buying: There's {inv_chg} more inventory than last year "
+            f"and homes are sitting longer, which gives you more time to be thoughtful. Being "
+            f"pre-approved and ready to move quickly on the right home is your biggest advantage."
+        )
+
 
 def generate_email_content(tag, stats):
     """Generate formatted email content for Alex to review and send manually."""
@@ -485,36 +597,8 @@ def generate_email_content(tag, stats):
 
     bullets = "\n".join(f"  * {b}" for b in bullet_lines)
 
-    if tag == "seller":
-        insight = (
-            f"What this means: Supply is at {supply} months. Buyers have more to choose "
-            f"from now which means they're being more selective. The homes that are "
-            f"moving are the ones priced right and prepped well."
-        )
-        advice = (
-            f"My advice: Preparation matters more than ever right now. A solid pre-listing "
-            f"strategy around pricing, staging, and timing can make a real difference."
-        )
-    elif tag == "buyer":
-        insight = (
-            f"What this means: There's {inv_chg} more inventory than last year and "
-            f"homes are sitting longer, which gives you more time to be thoughtful. "
-            f"That said, supply is still only {supply} months so it's still competitive."
-        )
-        advice = (
-            f"My advice: With more options available, being pre-approved and ready to "
-            f"move quickly on the right home is your biggest advantage."
-        )
-    else:
-        insight = (
-            f"What this means: The market is finding more balance. Supply at {supply} "
-            f"months is still below what's considered balanced, but homes are taking "
-            f"longer to sell and buyers have more options."
-        )
-        advice = (
-            f"My advice: Whether you're thinking about buying, selling, or just keeping "
-            f"tabs on things, being informed puts you ahead."
-        )
+    # Get Claude-generated insight and advice
+    insight_and_advice = generate_email_insight(tag, stats)
 
     return f"""{month} {year} MARKET UPDATE — COPY/PASTE INTO GHL TEMPLATE
 {'=' * 60}
@@ -524,9 +608,7 @@ AUDIENCE: {tag.upper()}
 STATS:
 {bullets}
 
-{insight}
-
-{advice}
+{insight_and_advice}
 
 No rush on anything, just like keeping you informed. Always here if you want to talk through it.
 {'=' * 60}"""
