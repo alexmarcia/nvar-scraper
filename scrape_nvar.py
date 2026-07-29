@@ -625,7 +625,7 @@ STATS:
 
 {insight_and_advice}
 
-No rush on anything, just like keeping you informed. Always here if you want to talk through it.
+As always, I'm a call/email away if you need anything.
 {'=' * 60}"""
 
 
