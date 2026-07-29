@@ -328,7 +328,7 @@ def should_send_this_month(tags):
 
 # -- Claude API Helper ---------------------------------------------
 
-def call_claude(prompt):
+def call_claude(prompt, max_tokens=1000):
     """Generic Claude API call. Returns response text or None on failure."""
     if not ANTHROPIC_API_KEY:
         return None
@@ -344,7 +344,7 @@ def call_claude(prompt):
             },
             json={
                 "model": CLAUDE_MODEL,
-                "max_tokens": 1000,
+                "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=60,
@@ -354,6 +354,9 @@ def call_claude(prompt):
         # Concatenate all text blocks (adaptive-thinking models may return multiple blocks)
         text_parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
         result = "".join(text_parts).strip().strip('"')
+        if data.get("stop_reason") == "max_tokens":
+            print(f"    WARNING: Claude output was TRUNCATED at {max_tokens} tokens. Using fallback instead.")
+            return None
         return result if result else None
     except Exception as e:
         print(f"    Claude API error: {e}")
@@ -525,7 +528,7 @@ RULES:
 
 WRITE ONLY the two sections. Start with "What this means:" and then "My advice:". Nothing else."""
 
-    result = call_claude(prompt)
+    result = call_claude(prompt, max_tokens=3000)
     if result:
         return result
 
