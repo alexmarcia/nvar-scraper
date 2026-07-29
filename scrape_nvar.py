@@ -340,7 +340,7 @@ def call_claude(prompt):
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-5",
                 "max_tokens": 500,
                 "temperature": 0.7,
                 "messages": [{"role": "user", "content": prompt}],
