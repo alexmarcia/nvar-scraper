@@ -24,7 +24,8 @@ jobs:
       - name: Run NVAR scraper
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GHL_WEBHOOK_URL: ${{ secrets.GHL_WEBHOOK_URL }}
+          GHL_API_KEY: ${{ secrets.GHL_API_KEY }}
+          GHL_LOCATION_ID: ${{ secrets.GHL_LOCATION_ID }}
         run: python scrape_nvar.py
 
       - name: Commit last_sent.txt (track sent posts)
