@@ -1,149 +1,145 @@
 """
-NVAR Market Statistics Scraper + GHL Sender
-============================================
-Runs daily via GitHub Actions. Checks nvar.com for a new monthly
-"Market Statistics" post. If found (and not already sent), scrapes
-the key data, generates a ≤15-word text via Claude API, and fires
-a GHL webhook to trigger an SMS to your smart list.
+NVAR Market Statistics Scraper + GHL Direct Sender
+====================================================
+Runs daily via GitHub Actions at 10 AM ET.
+
+WHAT IT DOES:
+  1. Checks nvar.com for new regional "Market Statistics" posts
+  2. Scrapes key stats (median price, inventory, DOM, etc.)
+  3. Pulls contacts from GHL, checks their tags
+  4. Sends personalized SMS and/or email based on tags
+
+TAG SYSTEM:
+  Audience:    seller | buyer | (neither = general)
+  Delivery:    email-only | text-only | (neither = both)
+  Frequency:   quarterly | (neither = every month)
+  Alerts:      brightalerts -> gets nearby sold/listed texts (separate system)
+
+QUARTERLY MONTHS: January, April, July, October
 """
 
 import os
 import re
 import json
+import time
 import requests
 from datetime import datetime
 from pathlib import Path
 
-# ── Config (set these as GitHub Secrets) ──────────────────────────
+# -- Config --------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-GHL_WEBHOOK_URL = os.environ.get("GHL_WEBHOOK_URL", "")
+GHL_API_KEY = os.environ.get("GHL_API_KEY", "")
+GHL_LOCATION_ID = os.environ.get("GHL_LOCATION_ID", "")
 NVAR_NEWS_URL = "https://www.nvar.com/news/"
 LAST_SENT_FILE = Path(__file__).parent / "last_sent.txt"
 
+QUARTERLY_MONTHS = [1, 4, 7, 10]
+
+TAG_PROMPTS = {
+    "seller": (
+        "The recipient is a homeowner who may consider SELLING. "
+        "Pick stats that matter to sellers: inventory shifts, days on market, "
+        "buyer demand, pricing trends. The insight should help them understand "
+        "what this means for their home's position in the market."
+    ),
+    "buyer": (
+        "The recipient is looking to BUY a home. "
+        "Pick stats that matter to buyers: price movement, inventory growth, "
+        "more choices, any cooling or balancing signals. The insight should "
+        "help them see where the opportunity is right now."
+    ),
+}
+TAG_PRIORITY = ["seller", "buyer"]
+DEFAULT_PROMPT = (
+    "The recipient is a general real estate contact. "
+    "Give them a balanced update with whatever stats feel most interesting."
+)
+
+
+# -- Helpers -------------------------------------------------------
 
 def get_last_sent():
-    """Read the last sent post URL from file."""
     if LAST_SENT_FILE.exists():
         return LAST_SENT_FILE.read_text().strip()
     return ""
 
-
 def save_last_sent(url):
-    """Save the last sent post URL to file."""
     LAST_SENT_FILE.write_text(url)
 
-
 def fetch_page(url):
-    """Fetch a webpage and return its text content."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; NVARScraper/1.0)"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; NVARScraper/1.0)"}
     resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.text
 
+def is_quarterly_month():
+    return datetime.now().month in QUARTERLY_MONTHS
+
+
+# -- Find Latest Post ----------------------------------------------
 
 def find_latest_market_stats_post(html):
-    """
-    Find the most recent 'Market Statistics: <Month> <Year>' post link
-    on the NVAR news page. Returns (url, title) or (None, None).
-    """
-    # Pattern matches links like: /news/2026-02-09/market-statistics-january-2026/
-    # with titles like "Market Statistics: January 2026"
-    pattern = r'href="(https?://www\.nvar\.com/news/\d{4}-\d{2}-\d{2}/market-statistics-[a-z]+-\d{4}/?)"\s*'
-    urls = re.findall(pattern, html, re.IGNORECASE)
+    EXCLUDE_PATTERNS = [
+        "national", "comparison", "mid-year", "midyear", "forecast",
+        "summit", "condo", "navigating", "recognized", "shop",
+        "checklist", "book-of-lists", "legislative", "general-assembly",
+        "forms-changes", "new-member",
+    ]
+
+    def is_valid_url(url):
+        url_lower = url.lower()
+        return (
+            "market-statistics" in url_lower
+            and not any(exc in url_lower for exc in EXCLUDE_PATTERNS)
+        )
+
+    pattern = r'href="(https?://www\.nvar\.com/news/\d{4}-\d{2}-\d{2}/market-statistics-[a-z]+-\d{4}/?)"'
+    urls = [u for u in re.findall(pattern, html, re.IGNORECASE) if is_valid_url(u)]
 
     if not urls:
-        # Try relative URLs
-        pattern = r'href="(/news/\d{4}-\d{2}-\d{2}/market-statistics-[a-z]+-\d{4}/?)"\s*'
+        pattern = r'href="(/news/\d{4}-\d{2}-\d{2}/market-statistics-[a-z]+-\d{4}/?)"'
         rel_urls = re.findall(pattern, html, re.IGNORECASE)
-        urls = [f"https://www.nvar.com{u}" for u in rel_urls]
+        urls = [f"https://www.nvar.com{u}" for u in rel_urls if is_valid_url(u)]
 
     if not urls:
-        # Broader fallback: look for "Market Statistics:" text near links
         pattern = r'href="([^"]*market-statistics[^"]*)"'
-        urls = re.findall(pattern, html, re.IGNORECASE)
+        all_urls = re.findall(pattern, html, re.IGNORECASE)
         urls = [
             u if u.startswith("http") else f"https://www.nvar.com{u}"
-            for u in urls
-            # Exclude "national-market-statistics" and "year-end" posts
-            if "national-market" not in u.lower()
-            and "year-end" not in u.lower()
-            and "comparison" not in u.lower()
+            for u in all_urls if is_valid_url(u)
         ]
 
     if urls:
-        return urls[0]
-    return None
+        print(f"  Found: {urls[0]}")
+    return urls[0] if urls else None
 
 
-def search_for_press_release(month_name, year):
-    """
-    Fallback: search PR Newswire for the NVAR press release
-    in case the NVAR site is slow to update.
-    """
-    search_url = (
-        f"https://www.prnewswire.com/news-releases/"
-        f"?keyword=NVAR+market+statistics+{month_name}+{year}"
-    )
-    try:
-        html = fetch_page(search_url)
-        pattern = r'href="([^"]*northern-virginia[^"]*market[^"]*)"'
-        matches = re.findall(pattern, html, re.IGNORECASE)
-        if matches:
-            url = matches[0]
-            if not url.startswith("http"):
-                url = f"https://www.prnewswire.com{url}"
-            return url
-    except Exception:
-        pass
-    return None
-
+# -- Extract Stats -------------------------------------------------
 
 def extract_stats_from_article(html):
-    """
-    Extract key market statistics from the article/press release HTML.
-    Returns a dict with the parsed numbers.
-    """
     stats = {}
 
-    # Closed sales
-    m = re.search(
-        r'(\d[\d,]+)\s+homes?\s+closed',
-        html, re.IGNORECASE
-    )
+    m = re.search(r'(\d[\d,]+)\s+homes?\s+closed', html, re.IGNORECASE)
     if m:
         stats["closed_sales"] = m.group(1).replace(",", "")
 
-    # Closed sales YoY change
-    m = re.search(
-        r'closed.*?(down|up)\s+([\d.]+)%',
-        html, re.IGNORECASE
-    )
+    m = re.search(r'closed.*?(down|up)\s+([\d.]+)%', html, re.IGNORECASE)
     if m:
         direction = "-" if m.group(1).lower() == "down" else "+"
         stats["closed_sales_change"] = f"{direction}{m.group(2)}%"
 
-    # Median sold price
-    m = re.search(
-        r'median\s+sold\s+price[^$]*\$([\d,]+)',
-        html, re.IGNORECASE
-    )
+    m = re.search(r'median\s+sold\s+price[^$]*\$([\d,]+)', html, re.IGNORECASE)
     if m:
         stats["median_price"] = m.group(1).replace(",", "")
 
-    # Median price YoY change
     m = re.search(
         r'median\s+sold\s+price[^%]*?(down|up|decrease|increase)\s+(?:of\s+)?([\d.]+)%',
         html, re.IGNORECASE
     )
-    if not m:
-        m = re.search(
-            r'\$[\d,]+[^%]*?median[^%]*?(down|up|decrease|increase)\s+(?:of\s+)?([\d.]+)%',
-            html, re.IGNORECASE
-        )
-    if not m:
-        # Handle "a 1.5% decrease" format (number before direction)
+    if m:
+        direction = "-" if m.group(1).lower() in ("down", "decrease") else "+"
+        stats["median_price_change"] = f"{direction}{m.group(2)}%"
+    else:
         m = re.search(
             r'median\s+sold\s+price[^%]*?([\d.]+)%\s+(decrease|increase|decline|gain)',
             html, re.IGNORECASE
@@ -151,121 +147,49 @@ def extract_stats_from_article(html):
         if m:
             direction = "-" if m.group(2).lower() in ("decrease", "decline") else "+"
             stats["median_price_change"] = f"{direction}{m.group(1)}%"
-            m = None  # Skip the normal handler below
-    if m:
-        direction = "-" if m.group(1).lower() in ("down", "decrease") else "+"
-        stats["median_price_change"] = f"{direction}{m.group(2)}%"
 
-    # Average days on market
-    m = re.search(
-        r'(?:average\s+)?days\s+on\s+market[^0-9]*?(\d+)\s+days',
-        html, re.IGNORECASE
-    )
+    m = re.search(r'(?:average\s+)?days\s+on\s+market[^0-9]*?(\d+)\s+days', html, re.IGNORECASE)
     if not m:
-        m = re.search(
-            r'(?:increased|decreased|was)[^0-9]*?to\s+(\d+)\s+days',
-            html, re.IGNORECASE
-        )
+        m = re.search(r'(?:increased|decreased|was)[^0-9]*?to\s+(\d+)\s+days', html, re.IGNORECASE)
     if not m:
-        m = re.search(
-            r'(\d+)\s+days\s+in\s+\w+\s+\d{4}',
-            html, re.IGNORECASE
-        )
+        m = re.search(r'(\d+)\s+days\s+in\s+\w+\s+\d{4}', html, re.IGNORECASE)
     if m:
         stats["days_on_market"] = m.group(1)
 
-    # Days on market YoY change
-    m = re.search(
-        r'days\s+on\s+market[^%]*?(down|up)\s+([\d.]+)%',
-        html, re.IGNORECASE
-    )
+    m = re.search(r'days\s+on\s+market[^%]*?(down|up)\s+([\d.]+)%', html, re.IGNORECASE)
     if m:
         direction = "-" if m.group(1).lower() == "down" else "+"
         stats["dom_change"] = f"{direction}{m.group(2)}%"
 
-    # Active listings
-    m = re.search(
-        r'active\s+listings[^0-9]*([\d,]+)\s+units',
-        html, re.IGNORECASE
-    )
+    m = re.search(r'active\s+listings[^0-9]*([\d,]+)\s+units', html, re.IGNORECASE)
     if not m:
-        m = re.search(
-            r'active\s+listings\s+(?:rose|fell|increased|decreased)[^0-9]*([\d,]+)\s+units',
-            html, re.IGNORECASE
-        )
-    if not m:
-        m = re.search(
-            r'to\s+([\d,]+)\s+units.*?active\s+listing',
-            html, re.IGNORECASE
-        )
-    if not m:
-        # "rose 21.1% year over year to 1,526 units"
-        m = re.search(
-            r'listings\s+rose[^0-9]*[\d.]+%[^0-9]*([\d,]+)\s+units',
-            html, re.IGNORECASE
-        )
+        m = re.search(r'listings\s+rose[^0-9]*[\d.]+%[^0-9]*([\d,]+)\s+units', html, re.IGNORECASE)
     if m:
         stats["active_listings"] = m.group(1).replace(",", "")
 
-    # Active listings YoY change
-    m = re.search(
-        r'active\s+listings[^%]*?(down|up)\s+([\d.]+)%',
-        html, re.IGNORECASE
-    )
+    m = re.search(r'active\s+listings[^%]*?(down|up)\s+([\d.]+)%', html, re.IGNORECASE)
     if m:
         direction = "-" if m.group(1).lower() == "down" else "+"
         stats["active_listings_change"] = f"{direction}{m.group(2)}%"
 
-    # New pending sales
-    m = re.search(
-        r'pending\s+sales.*?was\s+([\d,]+)\s+units',
-        html, re.IGNORECASE
-    )
+    m = re.search(r'pending\s+sales.*?was\s+([\d,]+)\s+units', html, re.IGNORECASE)
     if not m:
-        m = re.search(
-            r'(?:new\s+)?pending\s+sales[^0-9]*([\d,]+)\s+units',
-            html, re.IGNORECASE
-        )
-    if not m:
-        m = re.search(
-            r'([\d,]+)\s+(?:new\s+)?pending\s+sales',
-            html, re.IGNORECASE
-        )
+        m = re.search(r'(?:new\s+)?pending\s+sales[^0-9]*([\d,]+)\s+units', html, re.IGNORECASE)
     if m:
         stats["pending_sales"] = m.group(1).replace(",", "")
 
-    # Pending sales YoY change
-    m = re.search(
-        r'pending\s+sales[^%]*?(down|up)\s+([\d.]+)%',
-        html, re.IGNORECASE
-    )
+    m = re.search(r'pending\s+sales[^%]*?(down|up)\s+([\d.]+)%', html, re.IGNORECASE)
     if m:
         direction = "-" if m.group(1).lower() == "down" else "+"
         stats["pending_sales_change"] = f"{direction}{m.group(2)}%"
 
-    # Months of supply
-    m = re.search(
-        r'months\s+of\s+supply.*?was\s+([\d.]+\d)',
-        html, re.IGNORECASE
-    )
+    m = re.search(r'months\s+of\s+supply.*?was\s+([\d.]+\d)', html, re.IGNORECASE)
     if not m:
-        m = re.search(
-            r'months\s+of\s+supply.*?to\s+([\d.]+\d)',
-            html, re.IGNORECASE
-        )
-    if not m:
-        m = re.search(
-            r'([\d.]+\d)\s+months\s+of\s+supply',
-            html, re.IGNORECASE
-        )
+        m = re.search(r'months\s+of\s+supply.*?to\s+([\d.]+\d)', html, re.IGNORECASE)
     if m:
         stats["months_supply"] = m.group(1)
 
-    # Extract the month/year from the page
-    m = re.search(
-        r'Market\s+Statistics:?\s+(\w+)\s+(\d{4})',
-        html, re.IGNORECASE
-    )
+    m = re.search(r'Market\s+Statistics:?\s+(\w+)\s+(\d{4})', html, re.IGNORECASE)
     if m:
         stats["report_month"] = m.group(1)
         stats["report_year"] = m.group(2)
@@ -273,42 +197,193 @@ def extract_stats_from_article(html):
     return stats
 
 
-def generate_message_ai(stats):
-    """
-    Use Claude API to generate a concise ≤15-word text message
-    from the scraped stats.
-    """
-    if not ANTHROPIC_API_KEY:
-        print("⚠️  No ANTHROPIC_API_KEY set, falling back to template.")
-        return generate_message_template(stats)
+# -- GHL API -------------------------------------------------------
 
+def ghl_get_all_contacts():
+    if not GHL_API_KEY or not GHL_LOCATION_ID:
+        print("No GHL_API_KEY or GHL_LOCATION_ID set.")
+        return []
+
+    contacts = []
+    url = "https://services.leadconnectorhq.com/contacts/"
+    headers = {
+        "Authorization": f"Bearer {GHL_API_KEY}",
+        "Version": "2021-07-28",
+    }
+    params = {"locationId": GHL_LOCATION_ID, "limit": 100}
+
+    page = 1
+    while True:
+        print(f"  Fetching contacts page {page}...")
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            batch = data.get("contacts", [])
+            if not batch:
+                break
+
+            for c in batch:
+                tags = c.get("tags", [])
+                phone = c.get("phone", "")
+                email = (c.get("email") or "").strip()
+                first_name = (
+                    c.get("firstName", "") or c.get("firstNameLowerCase", "") or ""
+                ).strip().title()
+
+                if phone or email:
+                    contacts.append({
+                        "id": c.get("id"),
+                        "name": first_name,
+                        "phone": phone,
+                        "email": email,
+                        "tags": [t.lower().strip() for t in tags] if tags else [],
+                    })
+
+            meta = data.get("meta", {})
+            next_page = meta.get("nextPageUrl") or meta.get("nextPage")
+            if next_page and batch:
+                if isinstance(next_page, str) and next_page.startswith("http"):
+                    url = next_page
+                    params = {}
+                else:
+                    params["startAfterId"] = batch[-1].get("id", "")
+                page += 1
+            else:
+                break
+
+        except Exception as e:
+            print(f"GHL API error: {e}")
+            break
+
+    print(f"  Total contacts: {len(contacts)}")
+    return contacts
+
+
+def ghl_send_sms(contact_id, message):
+    url = "https://services.leadconnectorhq.com/conversations/messages"
+    headers = {
+        "Authorization": f"Bearer {GHL_API_KEY}",
+        "Version": "2021-04-15",
+        "Content-Type": "application/json",
+    }
+    payload = {"type": "SMS", "contactId": contact_id, "message": message}
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"    SMS failed: {e}")
+        return False
+
+
+def ghl_send_email(contact_id, subject, body_html):
+    url = "https://services.leadconnectorhq.com/conversations/messages"
+    headers = {
+        "Authorization": f"Bearer {GHL_API_KEY}",
+        "Version": "2021-04-15",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "type": "Email",
+        "contactId": contact_id,
+        "subject": subject,
+        "html": body_html,
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"    Email failed: {e}")
+        return False
+
+
+# -- Tag Helpers ---------------------------------------------------
+
+def get_audience_tag(tags):
+    for tag in TAG_PRIORITY:
+        if tag in tags:
+            return tag
+    return "general"
+
+def get_delivery_preference(tags):
+    if "email-only" in tags:
+        return "email-only"
+    if "text-only" in tags:
+        return "text-only"
+    return "both"
+
+def is_quarterly_contact(tags):
+    return "quarterly" in tags
+
+def should_send_this_month(tags):
+    if is_quarterly_contact(tags):
+        return is_quarterly_month()
+    return True
+
+
+# -- SMS Generation (AI) ------------------------------------------
+
+def generate_message_for_tag(tag, stats, first_name="", contact_index=0):
     month = stats.get("report_month", "")
     year = stats.get("report_year", "")
     median = stats.get("median_price", "")
     median_chg = stats.get("median_price_change", "")
     inv_chg = stats.get("active_listings_change", "")
     dom = stats.get("days_on_market", "")
+    dom_chg = stats.get("dom_change", "")
     pending_chg = stats.get("pending_sales_change", "")
+    closed_chg = stats.get("closed_sales_change", "")
+    supply = stats.get("months_supply", "")
 
-    prompt = f"""You are a real estate marketing assistant. Generate a text message 
-for a real estate agent's client list based on the latest Northern Virginia (NoVA) 
-housing market data.
+    try:
+        median_str = f"${int(median) // 1000}K"
+    except (ValueError, TypeError):
+        median_str = f"${median}"
+
+    tag_prompt = TAG_PROMPTS.get(tag, DEFAULT_PROMPT)
+    name = first_name if first_name else ""
+
+    prompt = f"""You are Alex Marcia, a realtor in Northern Virginia. Write a monthly 
+market update text to a client. 
+
+ALEX'S VOICE — warm, genuine, uses natural punctuation, says "no worries" and "happy to", 
+never salesy, always honest, gives counter-strategies not hype.
+
+TEXT TO: {name}
+THEIR SITUATION: {tag_prompt}
+
+{month} {year} DATA:
+- Median price: {median_str} ({median_chg} vs last year)
+- Inventory: {inv_chg} vs last year
+- Avg days on market: {dom} days ({dom_chg} vs last year)
+- Pending sales: {pending_chg} vs last year
+- Closed sales: {closed_chg} vs last year
+- Months of supply: {supply}
+
+FORMAT — CRITICAL, FOLLOW EXACTLY:
+- Two short paragraphs separated by a blank line
+- Paragraph 1: Greeting + 2-3 stats in one flowing sentence
+- Paragraph 2: One honest insight + warm CTA
+- TOTAL: 3-4 sentences. That's it. SHORT.
 
 RULES:
-- MUST be 15 words or fewer (this is a hard limit)
-- Casual, confident tone — like a knowledgeable friend texting
-- Include 1-2 key stats (pick the most compelling)
-- End with a soft call to action (e.g., "let's chat", "reach out", "thinking of moving?")
-- Do NOT use hashtags or emojis
-- Do NOT include "NVAR" — just say "NoVA" or "Northern Virginia"
+- HONEST and UNBIASED — never "great time to buy/sell"
+- Sellers: opportunity AND what to watch for
+- Buyers: challenges AND where the upside is
+- NEVER make value judgments on prices (affordable, luxury, solid price point, great deal)
+- Only make data-backed statements. Never assume or speculate beyond what the numbers show.
+- Never repeat openers, insights, or CTAs (message #{contact_index + 1} of 36+)
+- Vary which stats you pick each time
+- No hyphens or dashes. Use commas and periods.
+- Mix Hey/hey randomly.
 
-DATA for {month} {year}:
-- Median sold price: ${median} ({median_chg} YoY)
-- Active listings change: {inv_chg} YoY
-- Avg days on market: {dom} days
-- Pending sales change: {pending_chg} YoY
+WRITE ONLY THE TEXT MESSAGE. Nothing else."""
 
-Generate ONLY the text message, nothing else."""
+    if not ANTHROPIC_API_KEY:
+        return generate_template_message(tag, stats, first_name)
 
     try:
         resp = requests.post(
@@ -320,7 +395,8 @@ Generate ONLY the text message, nothing else."""
             },
             json={
                 "model": "claude-sonnet-4-20250514",
-                "max_tokens": 100,
+                "max_tokens": 300,
+                "temperature": 0.9,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=30,
@@ -328,152 +404,245 @@ Generate ONLY the text message, nothing else."""
         resp.raise_for_status()
         data = resp.json()
         message = data["content"][0]["text"].strip().strip('"')
-        
-        # Verify word count
-        word_count = len(message.split())
-        if word_count > 18:  # small buffer for flexibility
-            print(f"⚠️  AI message too long ({word_count} words), falling back to template.")
-            return generate_message_template(stats)
-        
-        print(f"✅ AI-generated message ({word_count} words): {message}")
         return message
 
     except Exception as e:
-        print(f"⚠️  Claude API error: {e}. Falling back to template.")
-        return generate_message_template(stats)
+        print(f"    Claude API error: {e}")
+        return generate_template_message(tag, stats, first_name)
 
 
-def generate_message_template(stats):
-    """Fallback: simple template-based message."""
+def generate_template_message(tag, stats, first_name=""):
     month = stats.get("report_month", "This month")
     median = stats.get("median_price", "")
     inv_chg = stats.get("active_listings_change", "")
-
-    # Format median price
-    if median:
-        try:
-            median_num = int(median)
-            if median_num >= 1000:
-                median_str = f"${median_num // 1000}K"
-            else:
-                median_str = f"${median_num}"
-        except ValueError:
-            median_str = f"${median}"
-    else:
-        median_str = ""
-
-    msg = f"NoVA {month} update: {median_str} median, inventory {inv_chg}. Thinking of moving? Let's talk!"
-    print(f"📝 Template message: {msg}")
-    return msg
-
-
-def send_to_ghl(message, stats):
-    """
-    Send the generated message + stats to GHL via webhook.
-    GHL workflow will handle sending SMS to the smart list.
-    """
-    if not GHL_WEBHOOK_URL:
-        print("⚠️  No GHL_WEBHOOK_URL set. Skipping send.")
-        print(f"📱 Message that WOULD be sent: {message}")
-        return False
-
-    payload = {
-        "message": message,
-        "report_month": stats.get("report_month", ""),
-        "report_year": stats.get("report_year", ""),
-        "median_price": stats.get("median_price", ""),
-        "median_price_change": stats.get("median_price_change", ""),
-        "closed_sales": stats.get("closed_sales", ""),
-        "closed_sales_change": stats.get("closed_sales_change", ""),
-        "days_on_market": stats.get("days_on_market", ""),
-        "active_listings": stats.get("active_listings", ""),
-        "active_listings_change": stats.get("active_listings_change", ""),
-        "pending_sales": stats.get("pending_sales", ""),
-        "pending_sales_change": stats.get("pending_sales_change", ""),
-        "months_supply": stats.get("months_supply", ""),
-    }
+    dom = stats.get("days_on_market", "")
 
     try:
-        resp = requests.post(
-            GHL_WEBHOOK_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        print(f"✅ Successfully sent to GHL webhook. Status: {resp.status_code}")
-        return True
-    except Exception as e:
-        print(f"❌ GHL webhook error: {e}")
-        return False
+        median_str = f"${int(median) // 1000}K"
+    except (ValueError, TypeError):
+        median_str = f"${median}"
 
+    name = first_name if first_name else ""
+
+    if tag == "seller":
+        return f"Hey {name}! Wanted to share the {month} numbers with you. Inventory is up {inv_chg} from last year, homes are averaging about {dom} days on market, and median is at {median_str}.\n\nBuyers are being more selective, so preparation and pricing matter more than ever. If you ever want to talk through what that looks like for your situation im here."
+    elif tag == "buyer":
+        return f"Hey {name}! {month} market data just came out. Median is at {median_str}, there's {inv_chg} more inventory than last year, and homes are taking about {dom} days to sell now.\n\nThe pace is much more manageable than before. Happy to talk through what this means for your search whenever you have a chance."
+    else:
+        return f"Hey {name}! Quick {month} update for you. Median sitting at {median_str}, inventory up {inv_chg} from last year, and homes averaging {dom} days on market.\n\nThe market is finding more of a balance which is healthy for everyone. If any of this sparks questions don't hesitate to reach out."
+
+
+# -- Email Generation (sent to Alex for review) --------------------
+
+def generate_email_content(tag, stats):
+    """Generate formatted email content for Alex to review and send manually."""
+    month = stats.get("report_month", "")
+    year = stats.get("report_year", "")
+    median = stats.get("median_price", "")
+    median_chg = stats.get("median_price_change", "")
+    inv = stats.get("active_listings", "")
+    inv_chg = stats.get("active_listings_change", "")
+    dom = stats.get("days_on_market", "")
+    dom_chg = stats.get("dom_change", "")
+    pending = stats.get("pending_sales", "")
+    pending_chg = stats.get("pending_sales_change", "")
+    closed = stats.get("closed_sales", "")
+    closed_chg = stats.get("closed_sales_change", "")
+    supply = stats.get("months_supply", "")
+
+    try:
+        median_fmt = f"${int(median):,}"
+    except (ValueError, TypeError):
+        median_fmt = f"${median}"
+    try:
+        inv_fmt = f"{int(inv):,}"
+    except (ValueError, TypeError):
+        inv_fmt = inv
+    try:
+        pending_fmt = f"{int(pending):,}"
+    except (ValueError, TypeError):
+        pending_fmt = pending
+    try:
+        closed_fmt = f"{int(closed):,}"
+    except (ValueError, TypeError):
+        closed_fmt = closed
+
+    bullet_lines = []
+    if median_fmt and median_chg:
+        bullet_lines.append(f"Median sold price: {median_fmt} ({median_chg} from last year)")
+    if inv_fmt and inv_chg:
+        bullet_lines.append(f"Active listings: {inv_fmt} ({inv_chg} from last year)")
+    elif inv_chg:
+        bullet_lines.append(f"Active listings: {inv_chg} from last year")
+    if dom and dom_chg:
+        bullet_lines.append(f"Days on market: {dom} ({dom_chg} from last year)")
+    if pending_fmt and pending_chg:
+        bullet_lines.append(f"Pending sales: {pending_fmt} ({pending_chg} from last year)")
+    if closed_fmt and closed_chg:
+        bullet_lines.append(f"Closed sales: {closed_fmt} ({closed_chg} from last year)")
+    if supply:
+        bullet_lines.append(f"Months of supply: {supply}")
+
+    bullets = "\n".join(f"  * {b}" for b in bullet_lines)
+
+    if tag == "seller":
+        insight = (
+            f"What this means: Supply is at {supply} months. Buyers have more to choose "
+            f"from now which means they're being more selective. The homes that are "
+            f"moving are the ones priced right and prepped well."
+        )
+        advice = (
+            f"My advice: Preparation matters more than ever right now. A solid pre-listing "
+            f"strategy around pricing, staging, and timing can make a real difference."
+        )
+    elif tag == "buyer":
+        insight = (
+            f"What this means: There's {inv_chg} more inventory than last year and "
+            f"homes are sitting longer, which gives you more time to be thoughtful. "
+            f"That said, supply is still only {supply} months so it's still competitive."
+        )
+        advice = (
+            f"My advice: With more options available, being pre-approved and ready to "
+            f"move quickly on the right home is your biggest advantage."
+        )
+    else:
+        insight = (
+            f"What this means: The market is finding more balance. Supply at {supply} "
+            f"months is still below what's considered balanced, but homes are taking "
+            f"longer to sell and buyers have more options."
+        )
+        advice = (
+            f"My advice: Whether you're thinking about buying, selling, or just keeping "
+            f"tabs on things, being informed puts you ahead."
+        )
+
+    return f"""{month} {year} MARKET UPDATE — COPY/PASTE INTO GHL TEMPLATE
+{'=' * 60}
+
+AUDIENCE: {tag.upper()}
+
+STATS:
+{bullets}
+
+{insight}
+
+{advice}
+
+No rush on anything, just like keeping you informed. Always here if you want to talk through it.
+{'=' * 60}"""
+
+
+# -- Main ----------------------------------------------------------
 
 def main():
-    print(f"🔍 Checking NVAR for new market stats... ({datetime.now().isoformat()})")
+    print(f"Checking NVAR for new market stats... ({datetime.now().isoformat()})")
+    print(f"Quarterly month: {'YES' if is_quarterly_month() else 'NO'}")
 
-    # Step 1: Fetch the NVAR news page
     try:
         html = fetch_page(NVAR_NEWS_URL)
     except Exception as e:
-        print(f"❌ Failed to fetch NVAR news page: {e}")
+        print(f"Failed to fetch NVAR news page: {e}")
         return
 
-    # Step 2: Find the latest market stats post
     post_url = find_latest_market_stats_post(html)
     if not post_url:
-        print("ℹ️  No market statistics post found. Will check again tomorrow.")
+        print("No market statistics post found. Will check again tomorrow.")
         return
 
-    print(f"📰 Found post: {post_url}")
+    print(f"Found post: {post_url}")
 
-    # Step 3: Check if we already sent this one
     last_sent = get_last_sent()
     if post_url == last_sent:
-        print("ℹ️  Already sent this post. Nothing new to do.")
+        print("Already sent this post. Nothing new to do.")
         return
 
-    print("🆕 New post detected! Scraping stats...")
+    print("New post detected! Scraping stats...")
 
-    # Step 4: Fetch the full article
     try:
         article_html = fetch_page(post_url)
     except Exception as e:
-        # Try PR Newswire as fallback
-        print(f"⚠️  Could not fetch NVAR article ({e}), trying PR Newswire...")
-        now = datetime.now()
-        month_name = now.strftime("%B")
-        pr_url = search_for_press_release(month_name, str(now.year))
-        if pr_url:
-            try:
-                article_html = fetch_page(pr_url)
-            except Exception as e2:
-                print(f"❌ PR Newswire fallback also failed: {e2}")
-                return
-        else:
-            print("❌ No fallback source found.")
-            return
-
-    # Step 5: Extract the stats
-    stats = extract_stats_from_article(article_html)
-    if not stats.get("median_price"):
-        print("⚠️  Could not extract key stats. The page format may have changed.")
-        print(f"   Extracted so far: {json.dumps(stats, indent=2)}")
+        print(f"Could not fetch article: {e}")
         return
 
-    print(f"📊 Extracted stats: {json.dumps(stats, indent=2)}")
+    stats = extract_stats_from_article(article_html)
+    if not stats.get("median_price"):
+        print("Could not extract key stats. Page format may have changed.")
+        print(f"Extracted: {json.dumps(stats, indent=2)}")
+        return
 
-    # Step 6: Generate the text message
-    message = generate_message_ai(stats)
+    print(f"Stats: {json.dumps(stats, indent=2)}")
 
-    # Step 7: Send to GHL
-    sent = send_to_ghl(message, stats)
-
-    # Step 8: Save the post URL so we don't send again
-    if sent or not GHL_WEBHOOK_URL:
+    print("\nFetching contacts from GHL...")
+    contacts = ghl_get_all_contacts()
+    if not contacts:
+        print("No contacts found. Saving post URL.")
         save_last_sent(post_url)
-        print("💾 Saved post URL to prevent duplicate sends.")
+        return
 
-    print("✅ Done!")
+    # Find Alex's contact for notifications
+    alex_contact = None
+    for c in contacts:
+        if "admin" in c["tags"] or "owner" in c["tags"]:
+            alex_contact = c
+            break
+
+    print(f"\nProcessing {len(contacts)} contacts...")
+    total_sms = 0
+    total_skipped = 0
+    total_failed = 0
+
+    for i, contact in enumerate(contacts):
+        name = contact["name"]
+        tags = contact["tags"]
+        has_phone = bool(contact.get("phone"))
+
+        audience = get_audience_tag(tags)
+        delivery = get_delivery_preference(tags)
+
+        if not should_send_this_month(tags):
+            print(f"  {name} — quarterly, skipping this month")
+            total_skipped += 1
+            continue
+
+        send_sms = has_phone and delivery in ("both", "text-only")
+
+        if not send_sms:
+            print(f"  {name} — no valid SMS channel")
+            total_skipped += 1
+            continue
+
+        print(f"\n  -> {name} [{audience}] (delivery: {delivery})")
+
+        message = generate_message_for_tag(audience, stats, first_name=name, contact_index=i)
+        print(f"    SMS: {message[:80]}...")
+
+        if GHL_API_KEY:
+            if ghl_send_sms(contact["id"], message):
+                total_sms += 1
+            else:
+                total_failed += 1
+            time.sleep(0.5)
+        else:
+            print(f"    [DRY RUN]")
+            total_sms += 1
+
+    # Send notification to Alex
+    if alex_contact and GHL_API_KEY:
+        month = stats.get("report_month", "New")
+        notify_msg = f"New NVAR stats are out for {month}! Texts have been sent to your contacts. Check your email for the formatted content to paste into your GHL template."
+        ghl_send_sms(alex_contact["id"], notify_msg)
+        print(f"\n  Notification sent to Alex.")
+
+        # Send formatted email content to Alex for each audience type
+        for audience in ["seller", "buyer", "general"]:
+            content = generate_email_content(audience, stats)
+            subject = f"{month} Market Update — {audience.upper()} version (review before sending)"
+            body_html = content.replace("\n", "<br>")
+            ghl_send_email(alex_contact["id"], subject, body_html)
+            print(f"  Email content ({audience}) sent to Alex for review.")
+
+    save_last_sent(post_url)
+    print(f"\nDone! SMS: {total_sms} | Skipped: {total_skipped} | Failed: {total_failed}")
 
 
 if __name__ == "__main__":
