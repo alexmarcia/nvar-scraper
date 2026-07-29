@@ -538,6 +538,11 @@ def main():
     print(f"Checking NVAR for new market stats... ({datetime.now().isoformat()})")
     print(f"Quarterly month: {'YES' if is_quarterly_month() else 'NO'}")
 
+    # Check test mode
+    test_mode = os.environ.get("TEST_MODE", "false").lower() == "true"
+    if test_mode:
+        print("*** TEST MODE: Only sending to admin/owner contacts ***")
+
     try:
         html = fetch_page(NVAR_NEWS_URL)
     except Exception as e:
@@ -598,6 +603,12 @@ def main():
 
         audience = get_audience_tag(tags)
         delivery = get_delivery_preference(tags)
+
+        # TEST MODE: only send to admin/owner contacts
+        if test_mode and "admin" not in tags and "owner" not in tags:
+            print(f"  {name} — skipped (test mode)")
+            total_skipped += 1
+            continue
 
         if not should_send_this_month(tags):
             print(f"  {name} — quarterly, skipping this month")
