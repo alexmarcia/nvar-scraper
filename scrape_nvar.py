@@ -33,6 +33,8 @@ GHL_LOCATION_ID = os.environ.get("GHL_LOCATION_ID", "")
 NVAR_NEWS_URL = "https://www.nvar.com/news/"
 LAST_SENT_FILE = Path(__file__).parent / "last_sent.txt"
 
+CLAUDE_MODEL = "claude-sonnet-5"
+
 QUARTERLY_MONTHS = [1, 4, 7, 10]
 
 TAG_PROMPTS = {
@@ -331,6 +333,7 @@ def call_claude(prompt):
     if not ANTHROPIC_API_KEY:
         return None
 
+    resp = None
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -340,18 +343,26 @@ def call_claude(prompt):
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-5",
+                "model": CLAUDE_MODEL,
                 "max_tokens": 500,
                 "temperature": 0.7,
                 "messages": [{"role": "user", "content": prompt}],
             },
-            timeout=30,
+            timeout=60,
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["content"][0]["text"].strip().strip('"')
+        # Concatenate all text blocks (adaptive-thinking models may return multiple blocks)
+        text_parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+        result = "".join(text_parts).strip().strip('"')
+        return result if result else None
     except Exception as e:
         print(f"    Claude API error: {e}")
+        if resp is not None:
+            try:
+                print(f"    Details: {resp.text[:500]}")
+            except Exception:
+                pass
         return None
 
 
