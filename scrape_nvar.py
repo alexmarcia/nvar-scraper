@@ -344,7 +344,7 @@ def call_claude(prompt):
             },
             json={
                 "model": CLAUDE_MODEL,
-                "max_tokens": 500,
+                "max_tokens": 1000,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=60,
@@ -420,6 +420,7 @@ RULES:
 - Vary which stats you pick each time
 - No hyphens or dashes. Use commas and periods.
 - Mix Hey/hey randomly.
+- Never offer to meet in person, grab coffee, or commit Alex to in-person time. CTAs should be text, call, or chat based only.
 
 WRITE ONLY THE TEXT MESSAGE. Nothing else."""
 
@@ -520,6 +521,7 @@ RULES:
 - Be honest about both sides — opportunity AND risk.
 - Warm, professional tone. Not salesy.
 - No hyphens or dashes. Use commas and periods.
+- Never offer to meet in person, grab coffee, or commit Alex to in-person time. Any call to action should be text, call, or chat based only.
 
 WRITE ONLY the two sections. Start with "What this means:" and then "My advice:". Nothing else."""
 
