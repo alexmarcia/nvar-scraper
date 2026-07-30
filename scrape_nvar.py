@@ -163,7 +163,7 @@ def extract_stats_from_article(html):
         direction = "-" if m.group(1).lower() == "down" else "+"
         stats["dom_change"] = f"{direction}{m.group(2)}%"
 
-    m = re.search(r'active\s+listings[^0-9]*([\d,]+)\s+units', html, re.IGNORECASE)
+    m = re.search(r'active\s+listings.{0,60}?([\d,]+)\s+(?:units|homes)', html, re.IGNORECASE)
     if not m:
         m = re.search(r'listings\s+rose[^0-9]*[\d.]+%[^0-9]*([\d,]+)\s+units', html, re.IGNORECASE)
     if m:
@@ -300,6 +300,160 @@ def ghl_send_email(contact_id, subject, body_html):
     except Exception as e:
         print(f"    Email failed: {e}")
         return False
+
+
+# -- GHL Custom Values + Tags ---------------------------------------
+
+def ghl_add_tag(contact_id, tag):
+    """Add a tag to a contact (triggers the NVAR send workflow)."""
+    url = f"https://services.leadconnectorhq.com/contacts/{contact_id}/tags"
+    headers = {
+        "Authorization": f"Bearer {GHL_API_KEY}",
+        "Version": "2021-07-28",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(url, headers=headers, json={"tags": [tag]}, timeout=30)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"    Tag add failed: {e}")
+        return False
+
+
+def ghl_get_custom_values():
+    """Fetch all custom values for the location. Returns {normalized_name: id}."""
+    url = f"https://services.leadconnectorhq.com/locations/{GHL_LOCATION_ID}/customValues"
+    headers = {
+        "Authorization": f"Bearer {GHL_API_KEY}",
+        "Version": "2021-07-28",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        mapping = {}
+        for cv in data.get("customValues", []):
+            key = cv.get("name", "").strip().lower().replace(" ", "_")
+            mapping[key] = cv.get("id")
+        return mapping
+    except Exception as e:
+        print(f"Custom values fetch failed: {e}")
+        return {}
+
+
+def ghl_update_custom_value(cv_id, name, value):
+    """Update a single custom value by ID."""
+    url = f"https://services.leadconnectorhq.com/locations/{GHL_LOCATION_ID}/customValues/{cv_id}"
+    headers = {
+        "Authorization": f"Bearer {GHL_API_KEY}",
+        "Version": "2021-07-28",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(url, headers=headers, json={"name": name, "value": value}, timeout=30)
+        if resp.status_code == 404 or resp.status_code == 405:
+            resp = requests.put(url, headers=headers, json={"name": name, "value": value}, timeout=30)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"    Custom value update failed ({name}): {e}")
+        return False
+
+
+def push_custom_values(stats, insights):
+    """Push all 13 nvar_* custom values to GHL. Returns True only if ALL succeed."""
+    median = stats.get("median_price", "")
+    try:
+        median_fmt = f"${int(median):,}"
+    except (ValueError, TypeError):
+        median_fmt = f"${median}"
+    inv = stats.get("active_listings", "")
+    try:
+        inv_fmt = f"{int(inv):,}"
+    except (ValueError, TypeError):
+        inv_fmt = inv
+    pending = stats.get("pending_sales", "")
+    try:
+        pending_fmt = f"{int(pending):,}"
+    except (ValueError, TypeError):
+        pending_fmt = pending
+    closed = stats.get("closed_sales", "")
+    try:
+        closed_fmt = f"{int(closed):,}"
+    except (ValueError, TypeError):
+        closed_fmt = closed
+
+    inv_chg = stats.get("active_listings_change", "")
+    active_val = f"{inv_fmt} ({inv_chg} from last year)" if inv_fmt and inv_chg else (f"{inv_chg} from last year" if inv_chg else inv_fmt)
+
+    values = {
+        "nvar_month": f"{stats.get('report_month','')} {stats.get('report_year','')}".strip(),
+        "nvar_median": f"{median_fmt} ({stats.get('median_price_change','')} from last year)",
+        "nvar_active": active_val,
+        "nvar_dom": f"{stats.get('days_on_market','')} ({stats.get('dom_change','')} from last year)",
+        "nvar_pending": f"{pending_fmt} ({stats.get('pending_sales_change','')} from last year)",
+        "nvar_closed": f"{closed_fmt} ({stats.get('closed_sales_change','')} from last year)",
+        "nvar_supply": stats.get("months_supply", ""),
+        "nvar_seller_meaning": insights.get("seller_meaning", ""),
+        "nvar_seller_advice": insights.get("seller_advice", ""),
+        "nvar_buyer_meaning": insights.get("buyer_meaning", ""),
+        "nvar_buyer_advice": insights.get("buyer_advice", ""),
+        "nvar_general_seller_part": insights.get("general_seller", ""),
+        "nvar_general_buyer_part": insights.get("general_buyer", ""),
+    }
+
+    cv_map = ghl_get_custom_values()
+    if not cv_map:
+        print("Could not fetch custom values from GHL. Aborting before any sends.")
+        return False
+
+    all_ok = True
+    for name, value in values.items():
+        cv_id = cv_map.get(name)
+        if not cv_id:
+            print(f"    MISSING custom value in GHL: {name} (create it in Settings > Custom Values)")
+            all_ok = False
+            continue
+        if ghl_update_custom_value(cv_id, name, value):
+            print(f"    Updated {name}")
+        else:
+            all_ok = False
+    return all_ok
+
+
+def split_sections(text, header_a, header_b):
+    """Split Claude output on two headers, return (part_a, part_b) without the headers."""
+    if not text:
+        return "", ""
+    idx_b = text.lower().find(header_b.lower())
+    if idx_b == -1:
+        return text.replace(header_a, "").strip(), ""
+    part_a = text[:idx_b]
+    part_b = text[idx_b + len(header_b):]
+    idx_a = part_a.lower().find(header_a.lower())
+    if idx_a != -1:
+        part_a = part_a[idx_a + len(header_a):]
+    return part_a.strip(), part_b.strip()
+
+
+def generate_all_insights(stats):
+    """Generate all audience insights and split into template-ready pieces."""
+    insights = {}
+
+    seller_raw = generate_email_insight("seller", stats)
+    m, a = split_sections(seller_raw, "What this means:", "My advice:")
+    insights["seller_meaning"], insights["seller_advice"] = m, a
+
+    buyer_raw = generate_email_insight("buyer", stats)
+    m, a = split_sections(buyer_raw, "What this means:", "My advice:")
+    insights["buyer_meaning"], insights["buyer_advice"] = m, a
+
+    general_raw = generate_email_insight("general", stats)
+    s, b = split_sections(general_raw, "If you're thinking about selling:", "If you're thinking about buying:")
+    insights["general_seller"], insights["general_buyer"] = s, b
+
+    return insights
 
 
 # -- Tag Helpers ---------------------------------------------------
@@ -688,8 +842,17 @@ def main():
             alex_contact = c
             break
 
+    # Generate insights and push custom values BEFORE any sends
+    print("\nGenerating email insights via Claude...")
+    insights = generate_all_insights(stats)
+    print("\nPushing custom values to GHL...")
+    if not push_custom_values(stats, insights):
+        print("Custom values incomplete. NOT tagging anyone. Fix and re-run.")
+        return
+
     print(f"\nProcessing {len(contacts)} contacts...")
     total_sms = 0
+    total_tagged = {"seller": 0, "buyer": 0, "general": 0}
     total_skipped = 0
     total_failed = 0
 
@@ -713,44 +876,58 @@ def main():
             continue
 
         send_sms = has_phone and delivery in ("both", "text-only")
+        send_email = bool(contact.get("email")) and delivery in ("both", "email-only")
 
-        if not send_sms:
-            print(f"  {name} — no valid SMS channel")
+        if not send_sms and not send_email:
+            print(f"  {name} — no valid channel")
             total_skipped += 1
             continue
 
         print(f"\n  -> {name} [{audience}] (delivery: {delivery})")
 
-        message = generate_message_for_tag(audience, stats, first_name=name, contact_index=i)
-        print(f"    SMS: {message[:80]}...")
+        if send_sms:
+            message = generate_message_for_tag(audience, stats, first_name=name, contact_index=i)
+            print(f"    SMS: {message[:80]}...")
+            if GHL_API_KEY:
+                if ghl_send_sms(contact["id"], message):
+                    total_sms += 1
+                else:
+                    total_failed += 1
+                time.sleep(0.5)
 
-        if GHL_API_KEY:
-            if ghl_send_sms(contact["id"], message):
-                total_sms += 1
+        if send_email:
+            if ghl_add_tag(contact["id"], "nvar-send"):
+                total_tagged[audience] += 1
+                print(f"    Tagged nvar-send (email will send via workflow)")
             else:
                 total_failed += 1
             time.sleep(0.5)
-        else:
-            print(f"    [DRY RUN]")
-            total_sms += 1
 
-    # Send notification to Alex
+    # Send confirmation + content copies to Alex
     if alex_contact and GHL_API_KEY:
         month = stats.get("report_month", "New")
-        notify_msg = f"New NVAR stats are out for {month}! Texts have been sent to your contacts. Check your email for the formatted content to paste into your GHL template."
+        notify_msg = (
+            f"NVAR {month} update sent. SMS: {total_sms}. "
+            f"Emails tagged: {total_tagged['seller']} sellers, {total_tagged['buyer']} buyers, "
+            f"{total_tagged['general']} general. Failed: {total_failed}. "
+            f"Content copies in your inbox."
+        )
         ghl_send_sms(alex_contact["id"], notify_msg)
-        print(f"\n  Notification sent to Alex.")
+        print(f"\n  Confirmation sent to Alex.")
 
-        # Send formatted email content to Alex for each audience type
-        for audience in ["seller", "buyer", "general"]:
-            content = generate_email_content(audience, stats)
-            subject = f"{month} Market Update — {audience.upper()} version (review before sending)"
-            body_html = content.replace("\n", "<br>")
-            ghl_send_email(alex_contact["id"], subject, body_html)
-            print(f"  Email content ({audience}) sent to Alex for review.")
+        # FYI copies of the content that went out (exact text pushed to custom values)
+        copies = [
+            ("SELLER", f"<b>What this means:</b><br>{insights['seller_meaning']}<br><br><b>My advice:</b><br>{insights['seller_advice']}"),
+            ("BUYER", f"<b>What this means:</b><br>{insights['buyer_meaning']}<br><br><b>My advice:</b><br>{insights['buyer_advice']}"),
+            ("GENERAL", f"<b>If you're thinking about selling:</b><br>{insights['general_seller']}<br><br><b>If you're thinking about buying:</b><br>{insights['general_buyer']}"),
+        ]
+        for label, body in copies:
+            subject = f"{month} NVAR content that went out — {label}"
+            ghl_send_email(alex_contact["id"], subject, body.replace("\n", "<br>"))
+            print(f"  Content copy ({label}) sent to Alex.")
 
     save_last_sent(post_url)
-    print(f"\nDone! SMS: {total_sms} | Skipped: {total_skipped} | Failed: {total_failed}")
+    print(f"\nDone! SMS: {total_sms} | Tagged: {total_tagged} | Skipped: {total_skipped} | Failed: {total_failed}")
 
 
 if __name__ == "__main__":
